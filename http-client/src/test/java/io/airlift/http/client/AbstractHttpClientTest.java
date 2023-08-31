@@ -649,7 +649,7 @@ public abstract class AbstractHttpClientTest
 
         response = executeRequest(request, createStatusResponseHandler());
         assertEquals(response.getStatusCode(), 302);
-        assertEquals(response.getHeader(LOCATION), baseURI.toASCIIString() + "/redirect");
+        assertEquals(response.getHeader(LOCATION), "/redirect");
         assertEquals(servlet.getRequestUri(), request.getUri());
     }
 
@@ -799,6 +799,7 @@ public abstract class AbstractHttpClientTest
             throws Exception
     {
         servlet.setResponseStatusCode(TestingStatusListener.EXCEPTION_STATUS);
+        servlet.setResponseBody("Failed");
 
         Request request = prepareGet()
                 .setUri(baseURI)
