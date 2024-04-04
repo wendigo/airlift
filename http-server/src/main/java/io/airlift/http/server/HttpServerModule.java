@@ -16,17 +16,21 @@
 package io.airlift.http.server;
 
 import com.google.inject.Binder;
+import com.google.inject.Inject;
 import com.google.inject.Key;
 import com.google.inject.Scopes;
+import com.google.inject.multibindings.ProvidesIntoOptional;
 import io.airlift.configuration.AbstractConfigurationAwareModule;
 import io.airlift.discovery.client.AnnouncementHttpServerInfo;
 import io.airlift.http.server.HttpServer.ClientCertificate;
 import io.airlift.http.server.HttpServerBinder.HttpResourceBinding;
 import jakarta.servlet.Filter;
+import org.eclipse.jetty.server.handler.ErrorHandler;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 
 import static com.google.inject.multibindings.Multibinder.newSetBinder;
 import static com.google.inject.multibindings.OptionalBinder.newOptionalBinder;
+import static com.google.inject.multibindings.ProvidesIntoOptional.Type.DEFAULT;
 import static io.airlift.configuration.ConditionalModule.conditionalModule;
 import static io.airlift.configuration.ConfigBinder.configBinder;
 import static io.airlift.event.client.EventBinder.eventBinder;
@@ -90,5 +94,21 @@ public class HttpServerModule
 
         install(conditionalModule(HttpServerConfig.class, HttpServerConfig::isHttpsEnabled, moduleBinder ->
                 configBinder(moduleBinder).bindConfig(HttpsConfig.class)));
+    }
+
+    @ProvidesIntoOptional(DEFAULT)
+    @Inject
+    protected ErrorHandler errorHandler(HttpServerConfig config)
+    {
+        return defaultErrorHandler(config);
+    }
+
+    public static ErrorHandler defaultErrorHandler(HttpServerConfig config)
+    {
+        ErrorHandler errorHandler = new ErrorHandler();
+        errorHandler.setShowMessageInTitle(config.isShowErrorInTitle());
+        errorHandler.setShowStacks(config.isShowStackTrace());
+        errorHandler.setShowCauses(config.isShowCauses());
+        return errorHandler;
     }
 }

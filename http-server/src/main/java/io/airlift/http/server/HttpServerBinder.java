@@ -3,12 +3,14 @@ package io.airlift.http.server;
 import com.google.common.collect.ImmutableList;
 import com.google.inject.Binder;
 import com.google.inject.Key;
+import org.eclipse.jetty.server.handler.ErrorHandler;
 import org.eclipse.jetty.util.VirtualThreads;
 
 import java.lang.annotation.Annotation;
 import java.util.ArrayList;
 import java.util.List;
 
+import static com.google.inject.Scopes.SINGLETON;
 import static com.google.inject.multibindings.Multibinder.newSetBinder;
 import static com.google.inject.multibindings.OptionalBinder.newOptionalBinder;
 import static java.util.Objects.requireNonNull;
@@ -48,6 +50,18 @@ public class HttpServerBinder
     public HttpServerBinder enableLegacyUriCompliance()
     {
         newOptionalBinder(binder, Key.get(Boolean.class, EnableLegacyUriCompliance.class)).setBinding().toInstance(true);
+        return this;
+    }
+
+    public HttpServerBinder bindErrorHandler(ErrorHandler errorHandler)
+    {
+        newOptionalBinder(binder, ErrorHandler.class).setBinding().toInstance(errorHandler);
+        return this;
+    }
+
+    public HttpServerBinder bindErrorHandler(Class<? extends ErrorHandler> errorHandlerClazz)
+    {
+        newOptionalBinder(binder, ErrorHandler.class).setBinding().to(errorHandlerClazz).in(SINGLETON);
         return this;
     }
 
