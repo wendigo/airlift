@@ -1,9 +1,10 @@
 package io.airlift.http.client.jetty;
 
+import io.airlift.http.client.AbstractHttpsClientTest;
 import io.airlift.http.client.HttpClientConfig;
 
-public class TestAsyncJettyHttpClientHttp2
-        extends TestAsyncJettyHttpClient
+public class TestJettyHttps2ClientHttps1Server
+        extends AbstractHttpsClientTest
 {
     @Override
     protected HttpClientConfig createClientConfig()

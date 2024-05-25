@@ -28,6 +28,7 @@ public class TestingHttpProxy
             throws Exception
     {
         this.server = new TestingHttpServer(
+                false,
                 keystore,
                 new ProxyServlet(),
                 config -> config.setSendDateHeader(false),

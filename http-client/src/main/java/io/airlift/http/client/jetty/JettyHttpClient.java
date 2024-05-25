@@ -118,6 +118,7 @@ import static io.airlift.node.AddressToHostname.tryDecodeHostnameToAddress;
 import static io.airlift.security.cert.CertificateBuilder.certificateBuilder;
 import static io.opentelemetry.api.common.AttributeKey.stringKey;
 import static java.lang.Math.max;
+import static java.lang.Math.min;
 import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -787,9 +788,8 @@ public class JettyHttpClient
 
         RequestSizeListener requestSize = new RequestSizeListener();
         jettyRequest.onRequestContent(requestSize);
-
         JettyResponseFuture<T, E> future = new JettyResponseFuture<>(request, jettyRequest, requestSize::getBytes, responseHandler, span, stats, recordRequestComplete);
-
+        httpClient.getScheduler().schedule(future::idleTimeout, min(httpClient.getConnectTimeout(), httpClient.getIdleTimeout()), MILLISECONDS);
         BufferingResponseListener listener = new BufferingResponseListener(future, Ints.saturatedCast(maxContentLength))
         {
             @Override
@@ -874,6 +874,12 @@ public class JettyHttpClient
     private HttpRequest buildJettyRequest(Request finalRequest, JettyRequestListener listener)
     {
         HttpRequest jettyRequest = (HttpRequest) httpClient.newRequest(finalRequest.getUri());
+        if (finalRequest.getUri().getScheme().equalsIgnoreCase("http")) {
+            // If this is clear-text communication use HTTP/1.1 protocol.
+            // This can be overridden with the request version set to HTTP/2 to enforce h2c.
+            jettyRequest.version(HttpVersion.HTTP_1_1);
+        }
+
         finalRequest.getHttpVersion().ifPresent(version -> {
             switch (version) {
                 case HTTP_1_1 -> jettyRequest.version(HttpVersion.HTTP_1_1);
