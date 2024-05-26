@@ -6,6 +6,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multiset;
 import io.airlift.http.client.HttpClient.HttpResponseFuture;
 import io.airlift.http.client.StatusResponseHandler.StatusResponse;
+import io.airlift.http.client.StreamingResponseHandler.StreamingResponse;
 import io.airlift.http.client.StringResponseHandler.StringResponse;
 import io.airlift.http.client.jetty.JettyHttpClient;
 import io.airlift.units.Duration;
@@ -16,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.parallel.Execution;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
@@ -63,6 +65,7 @@ import static io.airlift.http.client.Request.Builder.preparePut;
 import static io.airlift.http.client.ResponseHandlerUtils.propagate;
 import static io.airlift.http.client.StatusResponseHandler.createStatusResponseHandler;
 import static io.airlift.http.client.StreamingBodyGenerator.streamingBodyGenerator;
+import static io.airlift.http.client.StreamingResponseHandler.streamingResponseHandler;
 import static io.airlift.http.client.StringResponseHandler.createStringResponseHandler;
 import static io.airlift.testing.Assertions.assertBetweenInclusive;
 import static io.airlift.testing.Assertions.assertGreaterThanOrEqual;
@@ -599,6 +602,24 @@ public abstract class AbstractHttpClientTest
 
             int statusCode = executeRequest(server, request, createStatusResponseHandler()).getStatusCode();
             assertThat(statusCode).isEqualTo(543);
+        }
+    }
+
+    @Test
+    public void testStreamingResponseHandler()
+            throws Exception
+    {
+        servlet.setResponseBody(LARGE_CONTENT);
+
+        Request request = prepareGet()
+                .setUri(baseURI)
+                .build();
+
+        try (StreamingResponse streamingResponse = executeRequest(request, streamingResponseHandler())) {
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            streamingResponse.write(outputStream);
+            String responseString = outputStream.toString(UTF_8);
+            assertThat(responseString).isEqualTo(LARGE_CONTENT);
         }
     }
 

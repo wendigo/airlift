@@ -4,6 +4,10 @@ import io.airlift.http.client.AbstractHttpClientTest;
 import io.airlift.http.client.HttpClientConfig;
 import io.airlift.http.client.Request;
 import io.airlift.http.client.ResponseHandler;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.fail;
 
 public class TestAsyncJettyHttpClient
         extends AbstractHttpClientTest
@@ -38,6 +42,19 @@ public class TestAsyncJettyHttpClient
     {
         try (JettyHttpClient client = server.createClient(config)) {
             return executeAsync(client, request, responseHandler);
+        }
+    }
+
+    @Test
+    public void testStreamingResponseHandler()
+            throws Exception
+    {
+        try {
+            super.testStreamingResponseHandler();
+            fail("Should have thrown exception");
+        }
+        catch (AssertionError e) {
+            assertThat(e).hasRootCauseInstanceOf(IllegalArgumentException.class);
         }
     }
 
