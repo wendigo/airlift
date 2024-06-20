@@ -683,6 +683,11 @@ public class ConfigurationFactory
                     .collect(toImmutableList());
         }
 
+        if (type.isSubtypeOf(TypeToken.of(Optional.class))) {
+            TypeToken<?> argumentToken = getActualTypeArgument(type);
+            return Optional.ofNullable(coerce(argumentToken, value));
+        }
+
         // Look for a static valueOf(String) method
         try {
             Method valueOf = type.getRawType().getMethod("valueOf", String.class);
