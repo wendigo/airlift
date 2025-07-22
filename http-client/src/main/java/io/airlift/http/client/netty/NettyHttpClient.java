@@ -89,6 +89,7 @@ import static com.google.common.net.InetAddresses.isInetAddress;
 import static com.google.common.util.concurrent.Futures.addCallback;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
+import static io.airlift.concurrent.Threads.virtualThreadsNamed;
 import static io.airlift.http.client.netty.NettyHttpClient.HttpClientBuilder.httpClientBuilder;
 import static io.netty.buffer.Unpooled.wrappedBuffer;
 import static io.netty.channel.ChannelOption.ALLOCATOR;
@@ -97,8 +98,10 @@ import static io.opentelemetry.api.common.AttributeKey.stringKey;
 import static java.lang.Math.toIntExact;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.Executors.newThreadPerTaskExecutor;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.eclipse.jetty.client.HttpClient.normalizePort;
+import static reactor.core.scheduler.Schedulers.fromExecutor;
 import static reactor.netty.transport.ProxyProvider.Proxy.HTTP;
 import static reactor.netty.transport.ProxyProvider.Proxy.SOCKS4;
 
@@ -329,29 +332,23 @@ public class NettyHttpClient
         request = injectTracing(request, span);
         final Request finalRequest = request;
         Disposable subscription = sendRequest(request, nettyFuture)
-                .responseSingle((HttpClientResponse clientResponse, ByteBufMono content) -> Mono.just(clientResponse).zipWith(orElseEmpty(content)))
-                .doOnNext(tuple -> nettyFuture.registerCloseable(tuple.getT2()))
-                .subscribe(tuple -> {
-                    // record attributes
-                    span.setAttribute(HttpAttributes.HTTP_RESPONSE_STATUS_CODE, tuple.getT1().status().code());
-
-                    // negotiated http version
+                .responseSingle((HttpClientResponse clientResponse, ByteBufMono content) -> Mono.just(clientResponse).zipWith(orElseEmpty(content), NettyResponse::new))
+                .doOnNext(response -> nettyFuture.registerCloseable(response.getInputStream()))
+                .subscribeOn(fromExecutor(newThreadPerTaskExecutor(virtualThreadsNamed("http-client-" + name + "#%s"))))
+                .subscribe(nettyResponse -> {
+                    span.setAttribute(HttpAttributes.HTTP_RESPONSE_STATUS_CODE, nettyResponse.getStatusCode());
                     span.setAttribute(NetworkAttributes.NETWORK_PROTOCOL_NAME, "HTTP"); // https://osi-model.com/application-layer/
-                    span.setAttribute(NetworkAttributes.NETWORK_PROTOCOL_VERSION, getHttpVersion(tuple.getT1().version()));
+                    span.setAttribute(NetworkAttributes.NETWORK_PROTOCOL_VERSION, getHttpVersion(nettyResponse.getHttpVersion()));
 
-                    NettyResponse nettyResponse = new NettyResponse(tuple.getT1(), tuple.getT2());
-                    T value;
-
-                    try (var _ = tuple.getT2()) {
-                        value = responseHandler.handle(finalRequest, nettyResponse);
+                    try (var _ = nettyResponse.getInputStream()) {
+                        nettyFuture.setValue(responseHandler.handle(finalRequest, nettyResponse));
                     }
                     catch (Throwable exception) {
                         nettyFuture.setException(exception);
-                        return;
                     }
-
-                    nettyFuture.setValue(value);
-                    span.setAttribute(HttpIncubatingAttributes.HTTP_RESPONSE_BODY_SIZE, nettyResponse.getBytesRead());
+                    finally {
+                        span.setAttribute(HttpIncubatingAttributes.HTTP_RESPONSE_BODY_SIZE, nettyResponse.getBytesRead());
+                    }
                 }, nettyFuture::setException);
 
         addCallback(nettyFuture, new FutureCallback<>() {
@@ -382,21 +379,13 @@ public class NettyHttpClient
                 .switchIfEmpty(Mono.defer(() -> Mono.just(new ByteArrayInputStream(new byte[0]))));
     }
 
-    private String getHttpVersion(io.netty.handler.codec.http.HttpVersion version)
+    private String getHttpVersion(HttpVersion version)
     {
-        if (version.equals(io.netty.handler.codec.http.HttpVersion.HTTP_1_0)) {
-            return "1.0"; // https://datatracker.ietf.org/doc/html/rfc1945
-        }
-        if (version.equals(io.netty.handler.codec.http.HttpVersion.HTTP_1_1)) {
-            return "1.1"; // https://datatracker.ietf.org/doc/html/rfc2616
-        }
-        if (version.majorVersion() == 2) {
-            return "2"; // https://datatracker.ietf.org/doc/html/rfc9113
-        }
-        if (version.majorVersion() == 3) {
-            return "3"; // https://datatracker.ietf.org/doc/html/rfc9114
-        }
-        return "0.9"; // https://datatracker.ietf.org/doc/html/rfc1945
+        return switch (version) {
+            case HTTP_1 -> "1.0"; // https://datatracker.ietf.org/doc/html/rfc1945
+            case HTTP_2 -> "2"; // https://datatracker.ietf.org/doc/html/rfc9113
+            case HTTP_3 -> "3"; // https://datatracker.ietf.org/doc/html/rfc9114
+        };
     }
 
     public <T, E extends Exception> HttpClient.ResponseReceiver<?> sendRequest(Request request, NettyResponseFuture<T, E> nettyResponseFuture)

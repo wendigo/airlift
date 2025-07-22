@@ -8,7 +8,6 @@ import io.airlift.http.client.HttpVersion;
 import io.netty.handler.codec.http.HttpHeaders;
 import reactor.netty.http.client.HttpClientResponse;
 
-import java.io.IOException;
 import java.io.InputStream;
 
 public class NettyResponse
@@ -68,7 +67,6 @@ public class NettyResponse
 
     @Override
     public InputStream getInputStream()
-            throws IOException
     {
         return inputStream;
     }
