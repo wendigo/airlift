@@ -370,9 +370,9 @@ public abstract class AbstractHttpClientTest
                     .build();
 
             StatusResponse response1 = client.execute(request, createStatusResponseHandler());
-            Thread.sleep(1000);
+            Thread.sleep(500);
             StatusResponse response2 = client.execute(request, createStatusResponseHandler());
-            Thread.sleep(1000);
+            Thread.sleep(500);
             StatusResponse response3 = client.execute(request, createStatusResponseHandler());
 
             assertThat(response1.getHeader("remotePort")).isNotNull();
@@ -497,7 +497,7 @@ public abstract class AbstractHttpClientTest
             throws Exception
     {
         HttpClientConfig config = createClientConfig()
-                .setIdleTimeout(new Duration(500, MILLISECONDS));
+                .setRequestTimeout(new Duration(500, MILLISECONDS));
 
         try (CloseableTestHttpServer server = newServer()) {
             URI uri = URI.create(server.baseURI().toASCIIString() + "/?sleep=1000");

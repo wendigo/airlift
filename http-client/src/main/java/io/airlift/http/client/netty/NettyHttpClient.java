@@ -25,6 +25,7 @@ import io.netty.channel.nio.NioIoHandler;
 import io.netty.handler.ssl.CipherSuiteFilter;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.handler.timeout.ReadTimeoutHandler;
 import io.netty.handler.timeout.WriteTimeoutHandler;
 import io.netty.util.internal.EmptyArrays;
@@ -54,6 +55,7 @@ import reactor.netty.http.HttpProtocol;
 import reactor.netty.http.client.HttpClient;
 import reactor.netty.http.client.HttpClientRequest;
 import reactor.netty.http.client.HttpClientResponse;
+import reactor.netty.resources.ConnectionProvider;
 import reactor.netty.transport.ProxyProvider;
 
 import javax.net.ssl.SNIHostName;
@@ -80,7 +82,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
 
 import static com.google.common.base.Throwables.throwIfUnchecked;
 import static com.google.common.net.HttpHeaders.CONTENT_LENGTH;
@@ -89,8 +90,6 @@ import static com.google.common.util.concurrent.Futures.addCallback;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
 import static io.airlift.http.client.netty.NettyHttpClient.HttpClientBuilder.httpClientBuilder;
-import static io.airlift.http.client.netty.NettyResponseFuture.NettyAsyncHttpState.CONNECTED;
-import static io.airlift.http.client.netty.NettyResponseFuture.NettyAsyncHttpState.PROCESSING_RESPONSE;
 import static io.netty.buffer.Unpooled.wrappedBuffer;
 import static io.netty.channel.ChannelOption.ALLOCATOR;
 import static io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS;
@@ -98,6 +97,7 @@ import static io.opentelemetry.api.common.AttributeKey.stringKey;
 import static java.lang.Math.toIntExact;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.eclipse.jetty.client.HttpClient.normalizePort;
 import static reactor.netty.transport.ProxyProvider.Proxy.HTTP;
 import static reactor.netty.transport.ProxyProvider.Proxy.SOCKS4;
@@ -113,6 +113,7 @@ public class NettyHttpClient
     private final String name;
     private final TextMapPropagator propagator;
     private final Tracer tracer;
+    private final List<? extends HttpStatusListener> httpStatusListeners;
     private HttpClient client;
     private final List<? extends HttpRequestFilter> requestFilters;
     private final java.time.Duration idleTimeout;
@@ -165,16 +166,16 @@ public class NettyHttpClient
 
         requireNonNull(config, "config is null");
         requireNonNull(requestFilters, "requestFilters is null");
-        requireNonNull(httpStatusListeners, "httpStatusListeners is null");
+        this.httpStatusListeners = ImmutableList.copyOf(requireNonNull(httpStatusListeners, "httpStatusListeners is null"));
 
-        this.eventLoop = new MultiThreadIoEventLoopGroup(config.getMaxThreads(), daemonThreadsNamed("http-client-" + name + "-%s"), NioIoHandler.newFactory());
-        this.client = httpClientBuilder()
+        this.eventLoop = new MultiThreadIoEventLoopGroup(Runtime.getRuntime().availableProcessors(), daemonThreadsNamed("http-client-" + name + "-%s"), NioIoHandler.newFactory());
+        this.client = httpClientBuilder(name, config)
                 .configure(configureProxy(config))
                 .configure(configureSSL(config, maybeSslContext.orElseGet(() -> getSslContextFactory(config, environment))))
                 .configure(configureTimeouts(config))
-                .configure(configureStatusListeners(httpStatusListeners))
                 .configure(configureEventLoop(eventLoop))
-                .build();
+                .build()
+                .wiretap(true);
         this.idleTimeout = config.getIdleTimeout().toJavaTime();
         this.requestFilters = ImmutableList.copyOf(requestFilters);
     }
@@ -184,15 +185,6 @@ public class NettyHttpClient
         return client -> client
                 .runOn(eventLoop)
                 .option(ALLOCATOR, PooledByteBufAllocator.DEFAULT);
-    }
-
-    private HttpClientConfigurer configureStatusListeners(Iterable<? extends HttpStatusListener> httpStatusListeners)
-    {
-        return client -> client.doOnResponse((response, _) -> {
-            for (HttpStatusListener httpStatusListener : httpStatusListeners) {
-                httpStatusListener.statusReceived(response.status().code());
-            }
-        });
     }
 
     private static HttpClientConfigurer configureProxy(HttpClientConfig config)
@@ -225,8 +217,13 @@ public class NettyHttpClient
         return client -> client
                 .option(CONNECT_TIMEOUT_MILLIS, toIntExact(config.getConnectTimeout().toMillis()))
                 .doOnConnected(conn -> conn
-                    .addHandlerLast(new ReadTimeoutHandler(toIntExact(config.getIdleTimeout().toMillis())))
-                    .addHandlerLast(new WriteTimeoutHandler(toIntExact(config.getIdleTimeout().toMillis()))));
+                    .addHandlerLast(new IdleStateHandler(
+                            toIntExact(config.getIdleTimeout().toMillis()),
+                            toIntExact(config.getIdleTimeout().toMillis()),
+                            toIntExact(config.getIdleTimeout().toMillis()),
+                            MILLISECONDS))
+                    .addHandlerLast(new ReadTimeoutHandler(toIntExact(config.getRequestTimeout().toMillis()), MILLISECONDS))
+                    .addHandlerLast(new WriteTimeoutHandler(toIntExact(config.getRequestTimeout().toMillis()), MILLISECONDS)));
     }
 
     private static HttpClientConfigurer configureSSL(HttpClientConfig config, SslContext sslContext)
@@ -288,8 +285,7 @@ public class NettyHttpClient
             throws E
     {
         try {
-            return executeAsync(request, responseHandler)
-                    .get(request.getIdleTimeout().map(Duration::toJavaTime).orElse(idleTimeout).toMillis(), TimeUnit.MILLISECONDS);
+            return executeAsync(request, responseHandler).get(request.getIdleTimeout().map(Duration::toJavaTime).orElse(idleTimeout).toMillis(), MILLISECONDS);
         }
         catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -334,24 +330,28 @@ public class NettyHttpClient
         final Request finalRequest = request;
         Disposable subscription = sendRequest(request, nettyFuture)
                 .responseSingle((HttpClientResponse clientResponse, ByteBufMono content) -> Mono.just(clientResponse).zipWith(orElseEmpty(content)))
+                .doOnNext(tuple -> nettyFuture.registerCloseable(tuple.getT2()))
                 .subscribe(tuple -> {
-                    try {
-                        // record attributes
-                        span.setAttribute(HttpAttributes.HTTP_RESPONSE_STATUS_CODE, tuple.getT1().status().code());
+                    // record attributes
+                    span.setAttribute(HttpAttributes.HTTP_RESPONSE_STATUS_CODE, tuple.getT1().status().code());
 
-                        // negotiated http version
-                        span.setAttribute(NetworkAttributes.NETWORK_PROTOCOL_NAME, "HTTP"); // https://osi-model.com/application-layer/
-                        span.setAttribute(NetworkAttributes.NETWORK_PROTOCOL_VERSION, getHttpVersion(tuple.getT1().version()));
+                    // negotiated http version
+                    span.setAttribute(NetworkAttributes.NETWORK_PROTOCOL_NAME, "HTTP"); // https://osi-model.com/application-layer/
+                    span.setAttribute(NetworkAttributes.NETWORK_PROTOCOL_VERSION, getHttpVersion(tuple.getT1().version()));
 
-                        try (var _ = tuple.getT2()) {
-                            NettyResponse nettyResponse = new NettyResponse(tuple.getT1(), tuple.getT2());
-                            nettyFuture.setValue(responseHandler.handle(finalRequest, nettyResponse));
-                            span.setAttribute(HttpIncubatingAttributes.HTTP_RESPONSE_BODY_SIZE, nettyResponse.getBytesRead());
-                        }
+                    NettyResponse nettyResponse = new NettyResponse(tuple.getT1(), tuple.getT2());
+                    T value;
+
+                    try (var _ = tuple.getT2()) {
+                        value = responseHandler.handle(finalRequest, nettyResponse);
                     }
-                    catch (Exception exception) {
+                    catch (Throwable exception) {
                         nettyFuture.setException(exception);
+                        return;
                     }
+
+                    nettyFuture.setValue(value);
+                    span.setAttribute(HttpIncubatingAttributes.HTTP_RESPONSE_BODY_SIZE, nettyResponse.getBytesRead());
                 }, nettyFuture::setException);
 
         addCallback(nettyFuture, new FutureCallback<>() {
@@ -404,8 +404,27 @@ public class NettyHttpClient
         HttpClient requestClient = client
                 .headers(headerBuilder -> request.getHeaders().forEach(headerBuilder::add))
                 .followRedirect(request.isFollowRedirects())
-                .doOnConnected(_ -> nettyResponseFuture.setState(CONNECTED))
-                .doOnResponse((_, _) -> nettyResponseFuture.setState(PROCESSING_RESPONSE));
+                .doOnRequest((req, conn) -> {
+                    nettyResponseFuture.setState("request_sent");
+                })
+                .doOnConnected(conn -> {
+                    nettyResponseFuture.setState("connected");
+                    if (request.getIdleTimeout().isPresent()) {
+                        conn.addHandlerLast(new ReadTimeoutHandler(request.getIdleTimeout().get().toMillis(), MILLISECONDS));
+                    }
+                    if (request.getRequestTimeout().isPresent()) {
+                        conn.addHandlerLast(new ReadTimeoutHandler(request.getRequestTimeout().get().toMillis(), MILLISECONDS));
+                    }
+                })
+                .doOnResponse((response, _) -> {
+                    nettyResponseFuture.setState("response_processing");
+                    try {
+                        httpStatusListeners.forEach(httpStatusListener -> httpStatusListener.statusReceived(response.status().code()));
+                    }
+                    catch (Throwable e) {
+                        nettyResponseFuture.setException(e);
+                    }
+                });
 
         if (request.getHttpVersion().isPresent()) {
             requestClient = requestClient.protocol(listProtocols(request.getHttpVersion().get()));
@@ -662,9 +681,15 @@ public class NettyHttpClient
             return this;
         }
 
-        public static HttpClientBuilder httpClientBuilder()
+        public static HttpClientBuilder httpClientBuilder(String name, HttpClientConfig clientConfig)
         {
-            return new HttpClientBuilder(HttpClient.create());
+            ConnectionProvider provider = ConnectionProvider.builder(name)
+                    .maxConnections(clientConfig.getMaxConnectionsPerServer())
+                    .pendingAcquireMaxCount(clientConfig.getMaxRequestsQueuedPerDestination())
+                    .maxIdleTime(clientConfig.getDestinationIdleTimeout().toJavaTime())
+                    .build();
+
+            return new HttpClientBuilder(HttpClient.create(provider));
         }
 
         public HttpClient build()
