@@ -409,12 +409,10 @@ public class NettyHttpClient
                 })
                 .doOnConnected(conn -> {
                     nettyResponseFuture.setState("connected");
-                    if (request.getIdleTimeout().isPresent()) {
-                        conn.addHandlerLast(new ReadTimeoutHandler(request.getIdleTimeout().get().toMillis(), MILLISECONDS));
-                    }
-                    if (request.getRequestTimeout().isPresent()) {
-                        conn.addHandlerLast(new ReadTimeoutHandler(request.getRequestTimeout().get().toMillis(), MILLISECONDS));
-                    }
+                    request.getIdleTimeout().ifPresent(timeout ->
+                            conn.addHandlerLast(new IdleStateHandler(timeout.toMillis(), timeout.toMillis(), timeout.toMillis(), MILLISECONDS)));
+                    request.getRequestTimeout().ifPresent(timeout ->
+                            conn.addHandlerLast(new ReadTimeoutHandler(timeout.toMillis(), MILLISECONDS)));
                 })
                 .doOnResponse((response, _) -> {
                     nettyResponseFuture.setState("response_processing");
@@ -496,12 +494,6 @@ public class NettyHttpClient
                     }
                 }
                 catch (Exception e) {
-                    try {
-                        in.close();
-                    }
-                    catch (IOException ex) {
-                        sink.error(ex);
-                    }
                     sink.error(e);
                 }
                 return buffer;
@@ -689,7 +681,9 @@ public class NettyHttpClient
                     .maxIdleTime(clientConfig.getDestinationIdleTimeout().toJavaTime())
                     .build();
 
-            return new HttpClientBuilder(HttpClient.create(provider));
+            return new HttpClientBuilder(HttpClient.create(provider)
+                    .compress(true)
+                    .keepAlive(true));
         }
 
         public HttpClient build()

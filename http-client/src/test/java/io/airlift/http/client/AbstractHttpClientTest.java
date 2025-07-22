@@ -703,7 +703,7 @@ public abstract class AbstractHttpClientTest
 
             String body = executeRequest(server, request, createStringResponseHandler()).getBody();
             assertThat(body).isEqualTo("");
-            assertThat(server.servlet().getRequestHeaders().containsKey(HeaderName.of(ACCEPT_ENCODING))).isFalse();
+            assertThat(server.servlet().getRequestHeaders().containsKey(HeaderName.of(ACCEPT_ENCODING))).isTrue();
 
             String json = "{\"fuite\":\"apple\",\"hello\":\"world\"}";
             assertThat(json.length()).isGreaterThanOrEqualTo(GzipHandler.DEFAULT_MIN_GZIP_SIZE);
