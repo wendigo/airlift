@@ -16,6 +16,7 @@ package io.airlift.stats;
 import com.google.common.collect.ImmutableList;
 import com.google.common.io.Resources;
 import com.google.common.primitives.Doubles;
+import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
 import org.assertj.core.data.Offset;
 import org.junit.jupiter.api.RepeatedTest;
@@ -264,6 +265,261 @@ public class TestTDigest
 
         assertSimilar(deserialized, digest);
 
+        for (double quantile = 0; quantile <= 1; quantile += 0.1) {
+            assertThat(deserialized.valueAt(quantile)).isEqualTo(digest.valueAt(quantile));
+        }
+    }
+
+    @Test
+    public void testCompactSerializationEmpty()
+    {
+        TDigest digest = new TDigest();
+        TDigest deserialized = TDigest.deserialize(digest.serializeCompact());
+
+        assertSimilar(deserialized, digest);
+
+        deserialized.add(10);
+        assertThat(deserialized.getCount()).isEqualTo(1.0);
+        assertThat(deserialized.valueAt(0.5)).isEqualTo(10.0);
+    }
+
+    @Test
+    public void testCompactSerializationSingle()
+    {
+        TDigest digest = new TDigest();
+        digest.add(1);
+
+        TDigest deserialized = TDigest.deserialize(digest.serializeCompact());
+
+        assertSimilar(deserialized, digest);
+        assertThat(deserialized.valueAt(0)).isEqualTo(digest.valueAt(0));
+        assertThat(deserialized.valueAt(1)).isEqualTo(digest.valueAt(1));
+    }
+
+    @Test
+    public void testCompactSerializationComplex()
+    {
+        TDigest digest = new TDigest();
+        addAll(digest, asList(0, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 5, 6, 7));
+
+        assertCompactRoundTrip(digest);
+    }
+
+    @Test
+    public void testCompactSerializationNegativeAndLargeValues()
+    {
+        TDigest digest = new TDigest();
+        addAll(digest, asList(-1_000_000, -5, -1, 0, 1, 5, 1_000_000));
+
+        assertCompactRoundTrip(digest);
+    }
+
+    @Test
+    public void testCompactSerializationFractionalWeights()
+    {
+        // exercises the non-integral weight path, which falls back to fixed-width doubles
+        TDigest digest = new TDigest();
+        digest.add(1, 0.5);
+        digest.add(2, 1.25);
+        digest.add(3, 99999.999999999);
+
+        assertCompactRoundTrip(digest);
+    }
+
+    @Test
+    public void testCompactIsSmallerForIntegerData()
+    {
+        TDigest digest = new TDigest();
+        for (int i = 0; i < 10_000; i++) {
+            digest.add(i);
+        }
+
+        assertThat(digest.serializeCompact().length()).isLessThan(digest.serializedSizeInBytes() * 2 / 3);
+    }
+
+    @Test
+    public void testCompactWorstCaseIsBoundedByLegacyPlusNibbles()
+    {
+        // means 16 binades apart need full-width deltas and fractional weights cannot be integers;
+        // a non-default compression and a merge that moves min/max off the edge means fill the header
+        TDigest digest = new TDigest(50);
+        for (int i = -60; i <= 60; i++) {
+            digest.add(Math.scalb(1.0, 16 * i), 0.5);
+        }
+        TDigest other = new TDigest(50);
+        other.add(-Double.MAX_VALUE, 0.25);
+        other.add(Double.MAX_VALUE, 0.25);
+        digest.mergeWith(other);
+
+        // a full header is as long as the legacy one; each section adds a width byte per group of eight
+        int centroids = (digest.serializeLegacy().length() - 37) / 16;
+        assertThat(digest.serializeCompact().length()).isLessThanOrEqualTo(digest.serializeLegacy().length() + centroids + 1);
+        assertBitwiseCompactRoundTrip(digest);
+    }
+
+    @Test
+    public void testSerializeWritesLegacyFormat()
+    {
+        TDigest digest = new TDigest();
+        for (int i = 0; i < 10_000; i++) {
+            digest.add(i);
+        }
+
+        assertThat(digest.serialize()).isEqualTo(digest.serializeLegacy());
+    }
+
+    @Test
+    public void testLegacySerializationRoundTrip()
+    {
+        TDigest digest = new TDigest();
+        addAll(digest, asList(0, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 5, 6, 7));
+
+        // the legacy fixed-width encoder remains readable via deserialize()
+        TDigest deserialized = TDigest.deserialize(digest.serializeLegacy());
+
+        assertSimilar(deserialized, digest);
+        for (double quantile = 0; quantile <= 1; quantile += 0.1) {
+            assertThat(deserialized.valueAt(quantile)).isEqualTo(digest.valueAt(quantile));
+        }
+    }
+
+    @RepeatedTest(1000)
+    public void testCompactSerializationRandom()
+    {
+        TDigest digest = new TDigest();
+
+        List<Integer> values = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            values.add(ThreadLocalRandom.current().nextInt());
+        }
+
+        addAll(digest, values);
+
+        assertCompactRoundTrip(digest);
+    }
+
+    @Test
+    public void testDeserializeInvalidFormat()
+    {
+        assertThatThrownBy(() -> TDigest.deserialize(Slices.wrappedBuffer((byte) 99)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid format");
+    }
+
+    @Test
+    public void testCompactSingleValueRoundTrip()
+    {
+        double[] values = {0.0, -0.0, 1, -1, 3.14159, -2.5e300, Double.MIN_VALUE, Double.MAX_VALUE};
+        for (double value : values) {
+            for (double weight : new double[] {1, 7, 127, 128, 0.5, 0x1p56, 0x1p63, 1e20}) {
+                for (double compression : new double[] {TDigest.DEFAULT_COMPRESSION, 50}) {
+                    TDigest digest = new TDigest(compression);
+                    digest.add(value, weight);
+                    assertBitwiseCompactRoundTrip(digest);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testCompactSingleValueIsSmall()
+    {
+        TDigest digest = new TDigest();
+        digest.add(1_234_567);
+
+        // tag + flags + count + raw mean + width byte + the 1-bit weight in one byte
+        assertThat(digest.serializeCompact().length()).isEqualTo(13);
+        assertCompactRoundTrip(digest);
+    }
+
+    @Test
+    public void testCompactEmptyDigestRoundTrip()
+    {
+        assertBitwiseCompactRoundTrip(new TDigest());
+        assertBitwiseCompactRoundTrip(new TDigest(50));
+    }
+
+    @Test
+    public void testCompactMinMaxDifferentFromMeans()
+    {
+        // min and max lie outside the surviving centroid means after a merge of unequal partials
+        TDigest digest = new TDigest();
+        digest.add(5, 10);
+        TDigest other = new TDigest();
+        other.add(-3);
+        other.add(100);
+        digest.mergeWith(other);
+
+        assertBitwiseCompactRoundTrip(digest);
+    }
+
+    @Test
+    public void testCompactVarintBoundaries()
+    {
+        // mean deltas and weights that straddle every varint length, including the 9-byte escape
+        TDigest digest = new TDigest();
+        for (int shift = 0; shift < 63; shift += 7) {
+            digest.add(Math.scalb(1.0, shift), Math.max(1, Math.scalb(1.0, shift) - 1));
+            digest.add(Math.scalb(1.0, shift) + Math.ulp(Math.scalb(1.0, shift)), Math.scalb(1.0, shift));
+        }
+        digest.add(-Double.MAX_VALUE);
+        digest.add(Double.MAX_VALUE);
+        assertBitwiseCompactRoundTrip(digest);
+    }
+
+    @Test
+    public void testCompactDeserializeFromSlicedView()
+    {
+        TDigest digest = new TDigest();
+        for (int i = 0; i < 1000; i++) {
+            digest.add(i * 1.5, 3);
+        }
+        Slice compressed = digest.serializeCompact();
+
+        // a view at the very end of a larger buffer exercises the byte-at-a-time path near the array end
+        Slice buffer = Slices.allocate(compressed.length() + 5);
+        buffer.setBytes(5, compressed);
+        TDigest deserialized = TDigest.deserialize(buffer.slice(5, compressed.length()));
+        assertThat(deserialized.serializeLegacy()).isEqualTo(digest.serializeLegacy());
+
+        // a view with trailing bytes beyond the digest must not be confused by them
+        Slice padded = Slices.allocate(compressed.length() + 16);
+        padded.setBytes(0, compressed);
+        byte[] garbage = new byte[16];
+        Arrays.fill(garbage, (byte) 0xFF);
+        padded.setBytes(compressed.length(), garbage);
+        deserialized = TDigest.deserialize(padded.slice(0, compressed.length()));
+        assertThat(deserialized.serializeLegacy()).isEqualTo(digest.serializeLegacy());
+    }
+
+    @Test
+    public void testCompactDeserializeTruncated()
+    {
+        TDigest digest = new TDigest();
+        for (int i = 0; i < 100; i++) {
+            digest.add(i);
+        }
+        Slice compressed = digest.serializeCompact();
+        for (int length = 2; length < compressed.length(); length += 7) {
+            Slice truncated = compressed.slice(0, length);
+            assertThatThrownBy(() -> TDigest.deserialize(truncated))
+                    .isInstanceOfAny(IllegalArgumentException.class, IndexOutOfBoundsException.class);
+        }
+    }
+
+    private void assertBitwiseCompactRoundTrip(TDigest digest)
+    {
+        TDigest deserialized = TDigest.deserialize(digest.serializeCompact());
+        assertThat(deserialized.serializeLegacy()).isEqualTo(digest.serializeLegacy());
+    }
+
+    private void assertCompactRoundTrip(TDigest digest)
+    {
+        TDigest deserialized = TDigest.deserialize(digest.serializeCompact());
+
+        assertSimilar(deserialized, digest);
+
+        // the compact format is lossless, so the reconstructed quantiles must match exactly
         for (double quantile = 0; quantile <= 1; quantile += 0.1) {
             assertThat(deserialized.valueAt(quantile)).isEqualTo(digest.valueAt(quantile));
         }
